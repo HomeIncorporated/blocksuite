@@ -85,7 +85,7 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
   private _toBeMoved: EdgelessModel[] = [];
   private _autoPanTimer: number | null = null;
   private _dragging = false;
-  private _draggingAreaDisposables: DisposableGroup | null = null;
+  private _disposables: DisposableGroup | null = null;
 
   // For moving selection with space with mouse
   private _moveSelectionStartPos: IVec = [0, 0];
@@ -258,18 +258,16 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
 
   private _handleSurfaceDragMove(
     selected: CanvasElement,
-    initialBound: Bound,
+    bound: Bound,
     delta: IVec,
-    e: PointerEventState
+    shifted?: boolean
   ) {
     if (!this._lock) {
       this._lock = true;
       this._doc.captureSync();
     }
 
-    const bound = initialBound.clone();
-
-    if (e.keys.shift || this._edgeless.tools.shiftKey) {
+    if (shifted) {
       const snapAxis = this._getSnapAxis(delta[0], delta[1]);
       snapAxis === 'x' ? (bound.x += delta[0]) : (bound.y += delta[1]);
     } else {
@@ -288,12 +286,11 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
 
   private _handleBlockDragMove(
     block: EdgelessBlockModel,
-    initialBound: Bound,
+    bound: Bound,
     delta: IVec,
-    e: PointerEventState
+    shifted?: boolean
   ) {
-    const bound = initialBound.clone();
-    if (e.keys.shift || this._edgeless.tools.shiftKey) {
+    if (shifted) {
       const snapAxis = this._getSnapAxis(delta[0], delta[1]);
       snapAxis === 'x' ? (bound.x += delta[0]) : (bound.y += delta[1]);
     } else {
@@ -518,10 +515,10 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
     }
   };
 
-  private _clearDraggingAreaDisposable = () => {
-    if (this._draggingAreaDisposables) {
-      this._draggingAreaDisposables.dispose();
-      this._draggingAreaDisposables = null;
+  private _clearDisposable = () => {
+    if (this._disposables) {
+      this._disposables.dispose();
+      this._disposables = null;
     }
   };
 
@@ -537,7 +534,7 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
 
   private _clearSelectingState = () => {
     this._stopAutoPanning();
-    this._clearDraggingAreaDisposable();
+    this._clearDisposable();
 
     this._dragging = false;
     this._dragLastPos = [0, 0];
@@ -608,6 +605,52 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
     this._toBeMoved = Array.from(toBeMoved);
   }
 
+  private _moveContentByDelta(
+    [dx, dy]: IVec,
+    shifted?: boolean,
+    shouldUpdatePos?: boolean
+  ) {
+    const curBound = this._alignBound;
+    curBound.x += dx;
+    curBound.y += dy;
+
+    const alignRst = this._edgeless.service.snap.align(curBound);
+    const delta = [dx + alignRst.dx, dy + alignRst.dy];
+
+    curBound.x += alignRst.dx;
+    curBound.y += alignRst.dy;
+
+    this._toBeMoved.forEach((element, index) => {
+      if (isCanvasElement(element)) {
+        if (!this._isDraggable(element)) return;
+        this._handleSurfaceDragMove(
+          element,
+          this._selectedBounds[index],
+          delta,
+          shifted
+        );
+      } else {
+        this._handleBlockDragMove(
+          element as EdgelessBlockModel,
+          this._selectedBounds[index],
+          delta,
+          shifted
+        );
+      }
+    });
+
+    const frameBlock = this._service.frame.selectFrame(this._toBeMoved);
+    frameBlock
+      ? this._surface.overlays.frame.highlight(frameBlock as FrameBlockModel)
+      : this._surface.overlays.frame.clear();
+
+    if (shouldUpdatePos) {
+      const { zoom } = this._service;
+      this._dragStartPos[0] += delta[0] * zoom;
+      this._dragStartPos[1] += delta[1] * zoom;
+    }
+  }
+
   private initializeDragState(
     e: PointerEventState,
     dragType: DefaultModeDragType
@@ -629,13 +672,13 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
       this._toBeMoved
     );
 
+    this._clearDisposable();
+    this._disposables = new DisposableGroup();
+
     // If the drag type is selecting, set up the dragging area disposable group
     // If the viewport updates when dragging, should update the dragging area and selection
     if (this.dragType === DefaultModeDragType.Selecting) {
-      this._clearDraggingAreaDisposable();
-
-      this._draggingAreaDisposables = new DisposableGroup();
-      this._draggingAreaDisposables.add(
+      this._disposables.add(
         this._edgeless.service.viewport.viewportUpdated.on(() => {
           if (
             this.dragType === DefaultModeDragType.Selecting &&
@@ -646,11 +689,37 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
           }
         })
       );
+      return;
+    }
+
+    if (this.dragType === DefaultModeDragType.ContentMoving) {
+      this._disposables.add(
+        this._edgeless.service.viewport.viewportMoved.on(delta => {
+          if (
+            this.dragType === DefaultModeDragType.ContentMoving &&
+            this._dragging &&
+            !this._autoPanTimer
+          ) {
+            if (
+              this._toBeMoved.every(ele => {
+                return !this._isDraggable(ele);
+              })
+            ) {
+              return;
+            }
+
+            this._alignBound = this._edgeless.service.snap.setupAlignables(
+              this._toBeMoved
+            );
+
+            this._moveContentByDelta(delta);
+          }
+        })
+      );
     }
   }
 
   onContainerDragMove(e: PointerEventState) {
-    const { surface } = this._edgeless;
     const { viewport } = this._service;
     const zoom = viewport.zoom;
     switch (this.dragType) {
@@ -679,36 +748,9 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
 
         const dx = (e.x - this._dragStartPos[0]) / zoom;
         const dy = (e.y - this._dragStartPos[1]) / zoom;
-        const curBound = this._alignBound.clone();
-        curBound.x += dx;
-        curBound.y += dy;
+        const shifted = e.keys.shift || this._edgeless.tools.shiftKey;
 
-        const alignRst = this._edgeless.service.snap.align(curBound);
-        const delta = [dx + alignRst.dx, dy + alignRst.dy];
-
-        this._toBeMoved.forEach((element, index) => {
-          if (isCanvasElement(element)) {
-            if (!this._isDraggable(element)) return;
-            this._handleSurfaceDragMove(
-              element,
-              this._selectedBounds[index],
-              delta,
-              e
-            );
-          } else {
-            this._handleBlockDragMove(
-              element as EdgelessBlockModel,
-              this._selectedBounds[index],
-              delta,
-              e
-            );
-          }
-        });
-        const frame = this._edgeless.service.frame.selectFrame(this._toBeMoved);
-        frame
-          ? surface.overlays.frame.highlight(frame as FrameBlockModel)
-          : surface.overlays.frame.clear();
-
+        this._moveContentByDelta([dx, dy], shifted, true);
         break;
       }
       case DefaultModeDragType.NativeEditing: {
@@ -786,7 +828,7 @@ export class DefaultToolController extends EdgelessToolController<DefaultTool> {
       this._clearLastSelection();
     }
     this._stopAutoPanning();
-    this._clearDraggingAreaDisposable();
+    this._clearDisposable();
     noop();
   }
 

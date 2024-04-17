@@ -766,6 +766,7 @@ export class EdgelessRootBlockComponent extends BlockElement<
           const dy = simulateHorizontalScroll ? 0 : e.deltaY / viewport.zoom;
 
           viewport.applyDeltaCenter(dx, dy);
+          viewport.viewportMoved.emit([dx, dy]);
           e.stopPropagation();
         }
       })
