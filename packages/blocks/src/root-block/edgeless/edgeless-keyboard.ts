@@ -90,6 +90,10 @@ export class EdgelessPageKeyboardManager extends PageKeyboardManager {
           });
         },
         m: () => {
+          if (!rootElement.doc.awarenessStore.getFlag('enable_mindmap_entry')) {
+            return;
+          }
+
           if (this.rootElement.service.locked) return;
           if (this.rootElement.service.selection.editing) return;
           const edgelessService = this.rootElement.service;
